@@ -157,12 +157,12 @@ def add_files_to_collection(collection):
 
 
 def query_collection(collection):
-    st.subheader("Query Collection")
-
     total_docs = collection.count()
     if not total_docs:
         st.info("There are no documents in the collection yet. Add some files first!")
         return
+
+    st.subheader("Query Collection")
 
     col_query, col_num = st.columns([4, 1])
     with col_query:
