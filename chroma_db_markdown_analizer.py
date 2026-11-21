@@ -1,0 +1,581 @@
+import os
+import re
+import time
+from datetime import datetime
+
+import bm25s
+import chromadb
+import numpy as np
+import streamlit as st
+from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+import docx
+from pypdf import PdfReader
+
+
+# Extractin text fynction
+def extract_text_from_file(uploaded_file) -> str:
+    filename = uploaded_file.name.lower()
+
+    if filename.endswith(".pdf"):
+        reader = PdfReader(uploaded_file)
+        pages_text = [
+            page.extract_text() or ""
+            for page in reader.pages
+            if page.extract_text().strip()
+        ]
+        return "\n".join(pages_text)
+
+    elif filename.endswith(".docx"):
+        doc = docx.Document(uploaded_file)
+        paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+
+        # Handling tables in .docx
+        for table in doc.tables:
+            for row in table.rows:
+                paragraphs.append(" | ".join(cell.text.strip() for cell in row.cells))
+        return "\n".join(paragraphs)
+
+    else:
+        # Other text files
+        return uploaded_file.read().decode("utf-8", errors="ignore")
+
+
+# Chunker function
+def smart_chunker(
+    text: str, extension: str, max_chars: int = 900, overlap: int = 120
+) -> list[str]:
+    ext = extension.lower()
+
+    # Picking correct chunking strategy depending on extension
+    if ext == ".py":
+        blocks = re.split(r"(?=\n(?:async\s+def|def|class)\s+)", text)
+    elif ext == ".md":
+        blocks = re.split(r"(?=\n#{1,3}\s+)", text)
+    else:
+        blocks = text.split("\n\n")
+
+    chunks = []
+    current_chunk = ""
+
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+
+        if len(current_chunk) + len(block) + 2 <= max_chars:
+            current_chunk = f"{current_chunk}\n\n{block}".strip()
+        else:
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+
+            # Cutting block if it's bigger than max_chars
+            if len(block) > max_chars:
+                lines = block.splitlines()
+                sub_chunk = ""
+                for line in lines:
+                    if len(sub_chunk) + len(line) + 1 <= max_chars:
+                        sub_chunk = f"{sub_chunk}\n{line}".strip()
+                    else:
+                        if sub_chunk:
+                            chunks.append(sub_chunk)
+                            # Overlap
+                            overlap_part = sub_chunk[-overlap:]
+                            sub_chunk = f"{overlap_part}\n{line}".strip()
+                        else:
+                            for i in range(0, len(line), max_chars - overlap):
+                                chunks.append(line[i : i + max_chars])
+                            sub_chunk = ""
+                if sub_chunk:
+                    current_chunk = sub_chunk
+            else:
+                current_chunk = block
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    return chunks
+
+
+# Caching bm25_retriever
+@st.cache_resource
+def get_bm25_retriever(corpus_tuple: tuple[str, ...]):
+    corpus = list(corpus_tuple)
+    retriever = bm25s.BM25()
+    retriever.index(bm25s.tokenize(corpus, show_progress=False), show_progress=False)
+    return retriever
+
+
+def bm25_search(corpus: list[str], query: str) -> np.ndarray:
+    if not corpus:
+        return np.array([], dtype=np.float32)
+
+    retriever = get_bm25_retriever(tuple(corpus))
+    documents, scores = retriever.retrieve(
+        bm25s.tokenize(query, show_progress=False),
+        k=len(corpus),
+        show_progress=False,
+    )
+    return documents[0], scores[0]
+
+
+# Getting ranks from scores for RRF function
+def scores_to_ranks(scores: np.ndarray, higher_is_better: bool = True) -> np.ndarray:
+    order = np.argsort(-scores if higher_is_better else scores)
+    ranks = np.empty_like(order, dtype=np.int32)
+    ranks[order] = np.arange(1, len(scores) + 1)
+    return ranks
+
+
+# Getting ranks from order for RRF function
+def order_to_ranks(order: np.ndarray) -> np.ndarray:
+    ranks = np.empty_like(order, dtype=np.int32)
+    ranks[order] = np.arange(1, len(order) + 1)
+    return ranks
+
+
+# RRF function
+def get_rrf_top_n(
+    dense_distances: list[float],
+    sparse_orders: np.ndarray,
+    n: int,
+    k: int = 60,
+) -> tuple[np.ndarray, np.ndarray]:
+    dense_arr = np.asarray(dense_distances, dtype=np.float32)
+
+    # Dense (ChromaDB): smaller distance = better match
+    # Sparse (BM25): higher score = better match
+    dense_ranks = scores_to_ranks(dense_arr, higher_is_better=False)
+    sparse_ranks = order_to_ranks(sparse_orders)
+
+    rrf_scores = (1.0 / (k + dense_ranks)) + (1.0 / (k + sparse_ranks))
+
+    top_n_indices = np.argsort(-rrf_scores)[:n]
+    top_n_scores = rrf_scores[top_n_indices]
+
+    return top_n_indices, top_n_scores
+
+
+# Caching collection
+@st.cache_resource(show_spinner="Loading embedding models and databases...")
+def get_chroma_collection():
+    chroma_client = chromadb.PersistentClient(".")
+    embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+    return chroma_client.get_or_create_collection(
+        name="collection",
+        embedding_function=embedding_fn,
+    )
+
+
+def add_files_to_collection(collection):
+    ALLOWED_EXTENSIONS = {".md", ".txt", ".py", ".pdf", ".docx"}
+    BATCH_SIZE = 500
+
+    allowed_extensions_text = ", ".join(sorted(ALLOWED_EXTENSIONS))
+    st.subheader("Add Files to Collection")
+    st.caption(f"Supported file formats: {allowed_extensions_text}")
+
+    uploaded_files = st.file_uploader(
+        "Select a directory to upload:",
+        accept_multiple_files="directory",
+    )
+
+    if not uploaded_files:
+        return
+
+    skipped_files = [
+        f.name
+        for f in uploaded_files
+        if os.path.splitext(os.path.basename(f.name))[1].lower()
+        not in ALLOWED_EXTENSIONS
+    ]
+    valid_files = [
+        f
+        for f in uploaded_files
+        if os.path.splitext(os.path.basename(f.name))[1].lower() in ALLOWED_EXTENSIONS
+    ]
+
+    # Metrics
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Total Selected", len(uploaded_files))
+    col2.metric("Supported Files", len(valid_files))
+    col3.metric("Skipped Files", len(skipped_files))
+
+    if skipped_files:
+        with st.expander(f"View {len(skipped_files)} unsupported file(s)"):
+            st.write(skipped_files)
+
+    if not valid_files:
+        st.warning("No valid files (.py, .md, .txt) found in the selected directory.")
+        return
+
+    if st.button("Start Processing & Upload", type="primary", use_container_width=True):
+        all_ids = []
+        all_documents = []
+        all_metadatas = []
+        encoding_errors = []
+
+        root_directory = (
+            valid_files[0].name.split("/")[0]
+            if "/" in valid_files[0].name
+            else "uploaded_dir"
+        )
+
+        progress_bar = st.progress(0, text="Initializing file processing...")
+        total_valid = len(valid_files)
+
+        # Uploading files and breaking them into chunks
+        for idx_file, uploaded_file in enumerate(valid_files, start=1):
+            file_path_in_dir = uploaded_file.name
+            filename = os.path.basename(file_path_in_dir)
+            extension = os.path.splitext(filename)[1].lower()
+
+            progress_bar.progress(
+                idx_file / total_valid,
+                text=f"Processing ({idx_file}/{total_valid}): {filename}",
+            )
+
+            try:
+                content = extract_text_from_file(uploaded_file)
+            except UnicodeDecodeError:
+                encoding_errors.append(file_path_in_dir)
+                continue
+
+            # Getting chunks
+            chunks = smart_chunker(content, extension=extension)
+            current_time = time.time()
+
+            # Appending data
+            for idx_chunk, chunk_text in enumerate(chunks):
+                all_ids.append(f"{file_path_in_dir}_chunk_{idx_chunk}")
+                all_documents.append(chunk_text)
+                all_metadatas.append(
+                    {
+                        "source": file_path_in_dir,
+                        "directory": root_directory,
+                        "extension": extension,
+                        "uploaded_at": current_time,
+                        "chunk_index": idx_chunk,
+                    }
+                )
+
+        progress_bar.empty()
+
+        # Uploading all chunks
+        if all_ids:
+            with st.spinner("Saving chunks to the database..."):
+                for i in range(0, len(all_ids), BATCH_SIZE):
+                    collection.upsert(
+                        ids=all_ids[i : i + BATCH_SIZE],
+                        documents=all_documents[i : i + BATCH_SIZE],
+                        metadatas=all_metadatas[i : i + BATCH_SIZE],
+                    )
+
+            # Clearing cache
+            get_bm25_retriever.clear()
+            st.success(
+                f"Successfully added **{len(all_ids)}** chunks from **{total_valid - len(encoding_errors)}** files!"
+            )
+
+        if encoding_errors:
+            with st.expander(
+                f"Skipped {len(encoding_errors)} file(s) due to encoding issues"
+            ):
+                st.write(encoding_errors)
+
+
+def query_collection(collection):
+    st.subheader("Query Collection")
+
+    total_docs = collection.count()
+    if not total_docs:
+        st.info("There are no documents in the collection yet. Add some files first!")
+        return
+
+    col_query, col_num = st.columns([4, 1])
+    with col_query:
+        query = st.text_input(
+            "Search query:",
+            placeholder="Enter your question or keywords",
+        )
+    with col_num:
+        n_results = st.number_input(
+            "Max results:",
+            min_value=1,
+            max_value=total_docs,
+            value=min(3, total_docs),
+            step=1,
+        )
+
+    # Choosing search option
+    st.subheader("Select an appropriate type of search:")
+    search_options = [
+        "Hybrid search",
+        "Semantic (dense) search",
+        "Keyword (sparse) search",
+    ]
+    search_option = st.pills(
+        "Search",
+        options=search_options,
+        label_visibility="collapsed",
+        default=search_options[0],
+    )
+
+    # Metadata filters
+    query_meta = {}
+    with st.expander("Filter by Metadata (Optional)", expanded=False):
+        all_metadatas = collection.get(include=["metadatas"])["metadatas"]
+
+        if all_metadatas:
+            categorical_fields = sorted(
+                list(
+                    set(
+                        k
+                        for m in all_metadatas
+                        for k in m.keys()
+                        if k not in {"chunk_index", "uploaded_at"}
+                    )
+                )
+            )
+
+            for field in categorical_fields:
+                unique_values = sorted(
+                    list(set(m[field] for m in all_metadatas if field in m))
+                )
+                plural_label = (
+                    "All directories" if field == "directory" else f"All {field}s"
+                )
+                selected_vals = st.multiselect(
+                    f"Filter by {field}:",
+                    options=unique_values,
+                    placeholder=plural_label,
+                )
+                if selected_vals:
+                    query_meta[field] = {"$in": selected_vals}
+
+            # Date filter
+            has_uploaded_at = any("uploaded_at" in m for m in all_metadatas)
+            if has_uploaded_at:
+                use_date_filter = st.checkbox("Filter by upload date")
+                if use_date_filter:
+                    n_days = st.number_input(
+                        "Uploaded within the last N days:",
+                        min_value=1,
+                        max_value=3650,
+                        value=7,
+                        step=1,
+                    )
+                    cutoff_timestamp = time.time() - (n_days * 86400)
+                    query_meta["uploaded_at"] = {"$gte": cutoff_timestamp}
+
+    if st.button("Search", type="primary", use_container_width=True):
+        if not query.strip():
+            st.warning("Please enter a search query.")
+            return
+
+        if not query_meta:
+            where_filter = None
+        elif len(query_meta) == 1:
+            where_filter = query_meta
+        else:
+            where_filter = {"$and": [{k: v} for k, v in query_meta.items()]}
+
+        with st.spinner("Searching collection..."):
+            try:
+                coll = collection.get(
+                    where=where_filter,
+                    include=["documents", "metadatas"],
+                )
+                all_ids = coll["ids"]
+                all_docs = coll["documents"]
+                all_metas = coll["metadatas"]
+
+                if not all_ids:
+                    st.warning("No matching documents found for your filters.")
+                    return
+
+                dense_results = collection.query(
+                    query_texts=[query],
+                    n_results=len(all_ids),
+                    include=["distances"],
+                    where=where_filter,
+                )
+                dist_map = dict(
+                    zip(dense_results["ids"][0], dense_results["distances"][0])
+                )
+                # Dense results are not alligned with default order
+                aligned_dense_distances = [dist_map[doc_id] for doc_id in all_ids]
+
+                sparse_order, sparse_scores = bm25_search(all_docs, query)
+
+                actual_n = min(int(n_results), len(all_ids))
+                # Getting RRF scores
+                top_indices, top_n_scores = get_rrf_top_n(
+                    aligned_dense_distances, sparse_order, actual_n
+                )
+
+            except Exception as e:
+                st.error(f"Query failed: {e}")
+                return
+
+            # Getting selected search data
+            actual_indices = top_indices
+            actual_scores = top_n_scores
+            actual_score_name = "RRF Score (the bigger the better)"
+            if search_option == search_options[0]:
+                actual_indices = top_indices
+                actual_scores = top_n_scores
+            elif search_option == search_options[1]:
+                actual_indices = np.argsort(aligned_dense_distances)[:actual_n]
+                actual_scores = dense_results["distances"][0][:actual_n]
+                actual_score_name = "L2 Distance (the lower the better)"
+            elif search_option == search_options[2]:
+                actual_indices = sparse_order[:actual_n]
+                actual_scores = sparse_scores[:actual_n]
+                actual_score_name = "BM25 Score (the bigger the better)"
+
+        # Results
+        docs = [all_docs[i] for i in actual_indices]
+        metas = [all_metas[i] for i in actual_indices]
+
+        st.divider()
+        st.markdown(f"### Top {len(docs)} Result(s)")
+
+        for idx, (doc, meta, score) in enumerate(
+            zip(docs, metas, actual_scores), start=1
+        ):
+            with st.container(border=True):
+                header_col, score_col = st.columns([4, 1])
+
+                source = meta.get("source", "Unknown file")
+                chunk_idx = meta.get("chunk_index", "N/A")
+                uploaded_ts = meta.get("uploaded_at")
+                uploaded_str = (
+                    datetime.fromtimestamp(uploaded_ts).strftime("%Y-%m-%d %H:%M")
+                    if uploaded_ts
+                    else "N/A"
+                )
+
+                with header_col:
+                    st.markdown(f"**{idx}. `{source}`** *(Chunk {chunk_idx})*")
+                    st.caption(
+                        f"Directory: `{meta.get('directory', 'N/A')}` | "
+                        f"Extension: `{meta.get('extension', 'N/A')}` | "
+                        f"Uploaded: `{uploaded_str}`"
+                    )
+
+                with score_col:
+                    st.metric(actual_score_name, f"{score:.4f}")
+
+                st.code(doc[:400] + ("..." if len(doc) > 400 else ""), language=None)
+                if len(doc) > 400:
+                    with st.expander("Show full chunk text"):
+                        st.text(doc)
+
+
+def get_files_from_collection(collection):
+    if not collection.count():
+        st.info("There are no documents in the collection yet. Add some files first!")
+        return
+
+    results = collection.get(include=["metadatas"])
+    table_data = []
+
+    st.subheader("Files in the collection:")
+    for doc_id, metadata in zip(results["ids"], results["metadatas"]):
+        uploaded_ts = metadata.get("uploaded_at")
+        uploaded_str = (
+            datetime.fromtimestamp(uploaded_ts).strftime("%Y-%m-%d %H:%M")
+            if uploaded_ts
+            else "N/A"
+        )
+        table_data.append(
+            {
+                "ID": doc_id,
+                "Source": metadata.get("source", ""),
+                "Directory": metadata.get("directory", ""),
+                "Extension": metadata.get("extension", ""),
+                "Uploaded At": uploaded_str,
+            }
+        )
+
+    st.dataframe(table_data, use_container_width=True, hide_index=True)
+
+
+def delete_files_from_collection(collection):
+    if not collection.count():
+        st.info("There are no documents in the collection yet. Add some files first!")
+        return
+
+    st.subheader("Delete files from the collection")
+
+    all_metadatas = collection.get(include=["metadatas"])["metadatas"]
+    if not all_metadatas:
+        st.info("The collection is empty. Nothing to delete.")
+        return
+
+    unique_files = sorted(
+        list(set(m["source"] for m in all_metadatas if "source" in m))
+    )
+
+    files_to_delete = st.multiselect(
+        "Select files to delete:",
+        options=unique_files,
+        placeholder="Choose one or more files...",
+    )
+
+    if files_to_delete:
+        st.warning(f"Selected {len(files_to_delete)} file(s) for deletion.")
+
+        if st.button("Delete selected files", type="primary"):
+            collection.delete(where={"source": {"$in": files_to_delete}})
+            get_bm25_retriever.clear()
+            st.success(f"Deleted: {', '.join(files_to_delete)}")
+            st.rerun()
+
+
+def delete_collection(collection):
+    if not collection.count():
+        st.info("There are no documents in the collection yet. Add some files first!")
+        return
+
+    st.subheader("Are you sure you want to delete the whole collection?")
+    if st.button("Yes, delete everything", type="primary", use_container_width=True):
+        all_ids = collection.get()["ids"]
+        if all_ids:
+            collection.delete(ids=all_ids)
+        get_bm25_retriever.clear()
+        st.success("Collection was successfully cleared.")
+        st.rerun()
+
+
+# Main
+collection = get_chroma_collection()
+
+st.title("Select an option:")
+options = [
+    "📁 Add files",
+    "🔍 Query collection",
+    "📄 Show files",
+    "🗑️ Delete files",
+    "💥 Delete whole collection",
+]
+option = st.pills(
+    "Navigation",
+    options=options,
+    label_visibility="collapsed",
+    default=options[0],
+)
+
+if option is not None:
+    match option:
+        case "📁 Add files":
+            add_files_to_collection(collection)
+        case "🔍 Query collection":
+            query_collection(collection)
+        case "📄 Show files":
+            get_files_from_collection(collection)
+        case "🗑️ Delete files":
+            delete_files_from_collection(collection)
+        case "💥 Delete whole collection":
+            delete_collection(collection)
