@@ -1,4 +1,4 @@
-# Hybrid Document & Code Search (ChromaDB + BM25 + Streamlit)
+# Personal portfolio project: Hybrid Document & Code Search (ChromaDB + BM25 + Streamlit)
 
 An interactive Streamlit application for indexing and searching `.py`, `.md`, `.txt`, `.docx`, and `.pdf` files using **hybrid search**—combining semantic dense retrieval (**ChromaDB** + `all-mpnet-base-v2`) with lexical sparse retrieval (**BM25** via `bm25s`) using **Reciprocal Rank Fusion (RRF)**, complete with metadata filtering, dual data modes, and structure-aware chunking.
 
