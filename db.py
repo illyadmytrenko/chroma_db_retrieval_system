@@ -1,6 +1,7 @@
 import os
 import time
 from datetime import datetime
+import uuid
 
 import chromadb
 import numpy as np
@@ -31,9 +32,10 @@ def get_demo_collection():
 def get_user_collection():
     if "user_chroma_client" not in st.session_state:
         st.session_state.user_chroma_client = chromadb.EphemeralClient()
+        st.session_state.user_collection_name = f"user_docs_{uuid.uuid4().hex}"
 
     return st.session_state.user_chroma_client.get_or_create_collection(
-        name="user_docs",
+        name=st.session_state.user_collection_name,
         embedding_function=get_embedding_function(),
     )
 
@@ -416,4 +418,5 @@ def delete_collection(collection):
             collection.delete(ids=all_ids)
         get_bm25_retriever.clear()
         st.success("Collection was successfully cleared.")
+        time.sleep(0.5)
         st.rerun()
