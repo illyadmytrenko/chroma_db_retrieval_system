@@ -12,7 +12,7 @@ import docx
 from pypdf import PdfReader
 
 
-# Extractin text fynction
+# Extracting text fynction
 def extract_text_from_file(uploaded_file) -> str:
     filename = uploaded_file.name.lower()
 
@@ -156,14 +156,30 @@ def get_rrf_top_n(
     return top_n_indices, top_n_scores
 
 
-# Caching collection
-@st.cache_resource(show_spinner="Loading embedding models and databases...")
-def get_chroma_collection():
-    chroma_client = chromadb.PersistentClient(".")
-    embedding_fn = SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
-    return chroma_client.get_or_create_collection(
-        name="collection",
-        embedding_function=embedding_fn,
+# Caching the heavy embedding model once across the entire server
+@st.cache_resource(show_spinner="Loading embedding model...")
+def get_embedding_function():
+    return SentenceTransformerEmbeddingFunction(model_name="all-MiniLM-L6-v2")
+
+
+# Caching the shared preloaded demo database
+@st.cache_resource(show_spinner="Connecting to demo database...")
+def get_demo_collection():
+    client = chromadb.PersistentClient(path="./demo_chroma_db")
+    return client.get_or_create_collection(
+        name="demo_docs",
+        embedding_function=get_embedding_function(),
+    )
+
+
+# Storing the user's temporary in-memory database per session (not cached globally)
+def get_user_collection():
+    if "user_chroma_client" not in st.session_state:
+        st.session_state.user_chroma_client = chromadb.EphemeralClient()
+
+    return st.session_state.user_chroma_client.get_or_create_collection(
+        name="user_docs",
+        embedding_function=get_embedding_function(),
     )
 
 
@@ -215,18 +231,17 @@ def add_files_to_collection(collection):
         all_metadatas = []
         encoding_errors = []
 
-        root_directory = (
-            valid_files[0].name.split("/")[0]
-            if "/" in valid_files[0].name
-            else "uploaded_dir"
-        )
-
         progress_bar = st.progress(0, text="Initializing file processing...")
         total_valid = len(valid_files)
 
         # Uploading files and breaking them into chunks
         for idx_file, uploaded_file in enumerate(valid_files, start=1):
             file_path_in_dir = uploaded_file.name
+            root_directory = (
+                uploaded_file.name.split("/")[0]
+                if "/" in valid_files[0].name
+                else "uploaded_dir"
+            )
             filename = os.path.basename(file_path_in_dir)
             extension = os.path.splitext(filename)[1].lower()
 
@@ -550,16 +565,30 @@ def delete_collection(collection):
 
 
 # Main
-collection = get_chroma_collection()
+source_options = ["📚 Demo database (preloaded)", "📤 My files (temporary session)"]
+mode = st.sidebar.radio(
+    "Data source:",
+    source_options,
+)
+
+is_demo = mode == source_options[0]
+collection = get_demo_collection() if is_demo else get_user_collection()
 
 st.title("Select an option:")
-options = [
-    "📁 Add files",
-    "🔍 Query collection",
-    "📄 Show files",
-    "🗑️ Delete files",
-    "💥 Delete whole collection",
-]
+if is_demo:
+    options = ["🔍 Query collection", "📄 Show files"]
+    st.info(
+        "ℹ️ **Demo Mode:** Database is read-only. Switch to **My files** in the"
+        " sidebar to upload or delete your own documents."
+    )
+else:
+    options = [
+        "📁 Add files",
+        "🔍 Query collection",
+        "📄 Show files",
+        "🗑️ Delete files",
+        "💥 Delete whole collection",
+    ]
 option = st.pills(
     "Navigation",
     options=options,
@@ -570,12 +599,21 @@ option = st.pills(
 if option is not None:
     match option:
         case "📁 Add files":
-            add_files_to_collection(collection)
+            if is_demo:
+                st.error("Adding files is disabled in Demo mode.")
+            else:
+                add_files_to_collection(collection)
         case "🔍 Query collection":
             query_collection(collection)
         case "📄 Show files":
             get_files_from_collection(collection)
         case "🗑️ Delete files":
-            delete_files_from_collection(collection)
+            if is_demo:
+                st.error("Deleting files is disabled in Demo mode.")
+            else:
+                delete_files_from_collection(collection)
         case "💥 Delete whole collection":
-            delete_collection(collection)
+            if is_demo:
+                st.error("Deleting the collection is disabled in Demo mode.")
+            else:
+                delete_collection(collection)
